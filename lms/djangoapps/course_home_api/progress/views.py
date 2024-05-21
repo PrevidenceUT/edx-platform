@@ -14,7 +14,7 @@ from rest_framework.response import Response
 
 from xmodule.modulestore.django import modulestore
 from common.djangoapps.student.models import CourseEnrollment
-from lms.djangoapps.course_home_api.progress.serializers import ProgressTabSerializer
+from lms.djangoapps.course_home_api.progress.serializers import ProgressTabSerializer, CourseCompletionSerializer
 from lms.djangoapps.course_home_api.toggles import course_home_mfe_progress_tab_is_active
 from lms.djangoapps.courseware.access import has_access, has_ccx_coach_role
 from lms.djangoapps.course_blocks.api import get_course_blocks
@@ -270,3 +270,108 @@ class ProgressTabView(RetrieveAPIView):
         serializer = self.get_serializer_class()(data, context=context)
 
         return Response(serializer.data)
+
+
+class CourseCompletionView(RetrieveAPIView):
+    """
+    **Use Cases**
+
+        Request course completion details for all users in given course
+
+    **Example Requests**
+
+        GET api/course_home/v1/course_completion/{course_key}
+
+    **Response Values**
+
+    Body consists of the following fields:
+
+        username: (str) username of the student whose progress information is being displayed.
+        user_has_passing_grade: (bool) boolean on if the user has a passing grade in the course
+        certificate_data: Object containing information about the user's certificate status
+            cert_status: (str) the status of a user's certificate (full list of statuses are defined in
+                         lms/djangoapps/certificates/models.py)
+            cert_web_view_url: (str) the url to view the certificate
+            download_url: (str) the url to download the certificate
+        completion_summary: Object containing unit completion counts with the following fields:
+            complete_count: (float) number of complete units
+            incomplete_count: (float) number of incomplete units
+            locked_count: (float) number of units where contains_gated_content is True
+        course_grade: Object containing the following fields:
+            is_passing: (bool) whether the user's grade is above the passing grade cutoff
+            letter_grade: (str) the user's letter grade based on the set grade range.
+                                If user is passing, value may be 'A', 'B', 'C', 'D', 'Pass', otherwise none
+            percent: (float) the user's total graded percent in the course
+        enrollment_mode: (str) a str representing the enrollment the user has ('audit', 'verified', ...)
+
+    **Returns**
+
+        * 200 on success with above fields.
+        * 401 if the user is not authenticated or not enrolled.
+        * 403 if the user does not have access to the course.
+        * 404 if the course is not available or cannot be seen.
+    """
+
+    authentication_classes = (
+        JwtAuthentication,
+        BearerAuthenticationAllowInactiveUser,
+        SessionAuthenticationAllowInactiveUser,
+    )
+    permission_classes = (IsAuthenticated,)
+    serializer_class = CourseCompletionSerializer
+
+    def get_course_completion_info(self, course_id, user):
+        course_key = CourseKey.from_string(course_id)
+        student = user
+        username = user.username
+
+        if not course_home_mfe_progress_tab_is_active(course_key):
+            raise Http404
+
+        course = get_course_or_403(student, 'load', course_key, check_if_enrolled=False)
+
+        enrollment = CourseEnrollment.get_enrollment(student, course_key)
+        enrollment_mode = getattr(enrollment, 'mode', None)
+
+        if not (enrollment and enrollment.is_active):
+            return Response('User not enrolled.', status=401)
+
+        # The block structure is used for both the course_grade and has_scheduled content fields
+        # So it is called upfront and reused for optimization purposes
+        collected_block_structure = get_block_structure_manager(course_key).get_collected()
+        course_grade = CourseGradeFactory().read(student, collected_block_structure=collected_block_structure)
+
+        # recalculate course grade from visible grades (stored grade was calculated over all grades, visible or not)
+        course_grade.update(visible_grades_only=True)
+
+        # Get user_has_passing_grade data
+        user_has_passing_grade = False
+        if not student.is_anonymous:
+            user_grade = course_grade.percent
+            user_has_passing_grade = user_grade >= course.lowest_passing_grade
+
+        data = {
+            'username': username,
+            'user_has_passing_grade': user_has_passing_grade,
+            'certificate_data': get_cert_data(student, course, enrollment_mode, course_grade),
+            'completion_summary': get_course_blocks_completion_summary(course_key, student),
+            'course_grade': course_grade,
+            'enrollment_mode': enrollment_mode,
+        }
+        serializer = self.get_serializer_class()(data)
+
+        return Response(serializer.data)
+
+
+    def get(self, request, *args, **kwargs):
+        from common.djangoapps.student.models import CourseEnrollment
+        course_key_string = kwargs.get('course_key_string')
+        course_key = CourseKey.from_string(course_key_string)
+        enrollments = CourseEnrollment.objects.filter(course=course_key)
+        response_data = list()
+        for enrollment in enrollments:
+            user = enrollment.user
+            data = self.get_course_completion_info(course_key_string, user).data
+            response_data.append(data)
+
+        return Response(response_data)

@@ -145,3 +145,15 @@ class ProgressTabSerializer(VerifiedModeSerializer):
     username = serializers.CharField()
     user_has_passing_grade = serializers.BooleanField()
     verification_data = VerificationDataSerializer()
+
+
+class CourseCompletionSerializer(ReadOnlySerializer):
+    """
+    Serializer for CourseCompletionView API
+    """
+    username = serializers.CharField()
+    user_has_passing_grade = serializers.BooleanField()
+    certificate_data = CertificateDataSerializer()
+    completion_summary = serializers.DictField()
+    course_grade = CourseGradeSerializer()
+    enrollment_mode = serializers.CharField()
